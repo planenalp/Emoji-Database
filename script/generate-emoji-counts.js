@@ -1,16 +1,19 @@
 const fs = require('fs');
 const path = require('path');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
-const { parse } = require('fast-html-parser');
+const cheerio = require('cheerio');
 
 const EMOJI_COUNTS_URL = 'https://unicode.org/emoji/charts/emoji-counts.html';
 const EMOJI_DATA_URL = 'https://unicode.org/emoji/charts/full-emoji-list.html';
+const EMOJI_VERSION_URL = 'https://unicode.org/emoji/charts/emoji-versions.html';
 
 // 配置
 const CONFIG = {
   timeout: 30000, // 30秒超时
   maxRetries: 3,  // 最大重试次数
-  retryDelay: 2000 // 重试延迟（毫秒）
+  retryDelay: 2000, // 重试延迟（毫秒）
+  autoUpdate: true, // 自动更新开关
+  versionCheckInterval: 24 * 60 * 60 * 1000 // 版本检查间隔（24小时）
 };
 
 // 肤色修饰符
@@ -78,37 +81,55 @@ function parseEmojiData(html) {
   const emojiData = {};
   console.log('Starting to parse emoji data...');
   
-  const parsedRoot = parse(html);
-  const rows = parsedRoot.querySelectorAll('tr');
+  const $ = cheerio.load(html);
+  const rows = $('tr');
   console.log(`Found ${rows.length} potential emoji rows`);
   
   let processedCount = 0;
-  for (const row of rows) {
-    const codeCell = row.querySelector('.code');
-    const nameCell = row.querySelector('.name');
-    const groupCell = row.querySelector('.group');
+  rows.each((i, row) => {
+    const $row = $(row);
+    const codeCell = $row.find('.code');
+    const nameCell = $row.find('.name');
+    const groupCell = $row.find('.group');
     
-    if (!codeCell || !nameCell || !groupCell) continue;
+    if (!codeCell.length || !nameCell.length || !groupCell.length) return;
     
-    const codePoints = codeCell.text.trim().split(' ').map(cp => parseInt(cp, 16));
+    const codePoints = codeCell.text().trim().split(' ').map(cp => parseInt(cp, 16));
     const emoji = String.fromCodePoint(...codePoints);
-    const name = nameCell.text.trim();
-    const group = groupCell.text.trim();
+    const name = nameCell.text().trim();
+    const group = groupCell.text().trim();
     
-    // 检查是否支持肤色变体
-    const hasSkinToneSupport = name.toLowerCase().includes('hand') || 
-                             name.toLowerCase().includes('person') ||
-                             name.toLowerCase().includes('people');
+    // 改进的肤色变体检测逻辑
+    const hasSkinToneSupport = (
+      name.toLowerCase().includes('hand') || 
+      name.toLowerCase().includes('person') ||
+      name.toLowerCase().includes('people') ||
+      name.toLowerCase().includes('face') ||
+      name.toLowerCase().includes('gesture') ||
+      name.toLowerCase().includes('walking') ||
+      name.toLowerCase().includes('standing') ||
+      name.toLowerCase().includes('kneeling') ||
+      name.toLowerCase().includes('running') ||
+      name.toLowerCase().includes('standing') ||
+      name.toLowerCase().includes('sitting')
+    );
     
-    // 检查是否支持双肤色
-    const hasDualSkinToneSupport = name.toLowerCase().includes('handshake') || 
-                                  name.toLowerCase().includes('people holding hands');
+    // 改进的双肤色支持检测
+    const hasDualSkinToneSupport = (
+      name.toLowerCase().includes('handshake') || 
+      name.toLowerCase().includes('people holding hands') ||
+      name.toLowerCase().includes('couple') ||
+      name.toLowerCase().includes('family') ||
+      name.toLowerCase().includes('kiss') ||
+      name.toLowerCase().includes('couple with heart')
+    );
     
     emojiData[emoji] = {
       name,
       group,
       skin_tone_support: hasSkinToneSupport,
-      dual_skin_tone_support: hasDualSkinToneSupport
+      dual_skin_tone_support: hasDualSkinToneSupport,
+      code_points: codePoints
     };
     
     processedCount++;
@@ -125,7 +146,8 @@ function parseEmojiData(html) {
           group,
           skin_tone_support: true,
           is_variant: true,
-          base_emoji: emoji
+          base_emoji: emoji,
+          code_points: [...codePoints, modifier.codePointAt(0)]
         };
       });
       
@@ -140,13 +162,14 @@ function parseEmojiData(html) {
               skin_tone_support: true,
               dual_skin_tone_support: true,
               is_variant: true,
-              base_emoji: emoji
+              base_emoji: emoji,
+              code_points: [...codePoints, modifier1.codePointAt(0), modifier2.codePointAt(0)]
             };
           });
         });
       }
     }
-  }
+  });
   
   console.log(`Finished parsing. Total emojis processed: ${processedCount}`);
   console.log(`Total entries in emojiData: ${Object.keys(emojiData).length}`);
@@ -174,42 +197,29 @@ function parseEmojiCounts(html) {
     groups: {}
   };
 
-  const parsedRoot = parse(html);
-  const allRows = parsedRoot.querySelectorAll('tr');
-  const theadCells = allRows[0].childNodes;
-  const totalCells = allRows[allRows.length - 1].childNodes;
-
-  // 获取总计数
-  stats.total_without_skin_tone_variations = Number(totalCells[totalCells.length - 1].text);
-
-  // 获取各组别计数
-  const groups = ['Smileys & Emotion', 'People & Body', 'Animals & Nature', 'Food & Drink', 
-                 'Travel & Places', 'Activities', 'Objects', 'Symbols', 'Flags'];
-  const componentKey = 'Component';
-
-  for (let i = 0; i < theadCells.length; i++) {
-    const column = theadCells[i].text;
-    const count = Number(totalCells[i].text);
-    if (groups.includes(column)) {
-      stats.groups[column] = count;
-    } else if (column === componentKey) {
+  const $ = cheerio.load(html);
+  const rows = $('tr');
+  
+  // 跳过表头
+  for (let i = 1; i < rows.length; i++) {
+    const cells = $(rows[i]).find('td');
+    const category = $(cells[0]).text().trim();
+    const count = parseInt($(cells[1]).text().trim(), 10);
+    
+    if (category === 'Component') {
       stats.component = count;
+    } else if (category === 'Total') {
+      stats.total_with_variations = count;
+    } else if (category === 'With skin tone variations') {
+      stats.skin_tone_variations = count;
+    } else if (category !== 'Group' && !isNaN(count)) {
+      stats.groups[category] = count;
     }
   }
-
-  // 计算肤色变体总数
-  const skinToneMarker = '🏿';
-  const counts = allRows
-    .filter(row => row.childNodes[0].text.match(skinToneMarker))
-    .map(row => Number(row.childNodes[row.childNodes.length - 1].text));
-  const skinToneVariations = counts.reduce((a, b) => a + b, 0);
-
-  // 更新总计数
-  stats.total_without_skin_tone_variations = stats.total_without_skin_tone_variations - skinToneVariations - stats.component;
-
-  // 手动设置双肤色支持数量
-  stats.dual_skin_tone_support = 13;
-
+  
+  // 计算不包含肤色变体的总数
+  stats.total_without_skin_tone_variations = stats.total_with_variations - stats.skin_tone_variations - stats.component;
+  
   return stats;
 }
 
@@ -243,30 +253,58 @@ async function testWithMockData() {
   
   // 模拟emoji数据HTML
   const mockEmojiDataHtml = `
-    <tr class="r0">
-      <td class="code">1F600</td>
-      <td class="name">grinning face</td>
-      <td class="group">Smileys & Emotion</td>
-    </tr>
-    <tr class="r1">
-      <td class="code">1F91D</td>
-      <td class="name">handshake</td>
-      <td class="group">People & Body</td>
-    </tr>
-    <tr class="r2">
-      <td class="code">1F44B</td>
-      <td class="name">waving hand</td>
-      <td class="group">People & Body</td>
-    </tr>
+    <table>
+      <tr class="r0">
+        <td class="code">1F600</td>
+        <td class="name">grinning face</td>
+        <td class="group">Smileys & Emotion</td>
+      </tr>
+      <tr class="r1">
+        <td class="code">1F91D</td>
+        <td class="name">handshake</td>
+        <td class="group">People & Body</td>
+      </tr>
+      <tr class="r2">
+        <td class="code">1F44B</td>
+        <td class="name">waving hand</td>
+        <td class="group">People & Body</td>
+      </tr>
+      <tr class="r3">
+        <td class="code">1F46B</td>
+        <td class="name">woman and man holding hands</td>
+        <td class="group">People & Body</td>
+      </tr>
+    </table>
   `;
 
   // 模拟计数数据HTML
   const mockCountsHtml = `
-    <tr><td>Smileys & Emotion</td><td>100</td></tr>
-    <tr><td>People & Body</td><td>200</td></tr>
-    <tr><td>Total: 300</td></tr>
-    <tr><td>Components: 10</td></tr>
-    <tr><td>Dual skin tone support: 5</td></tr>
+    <table>
+      <tr>
+        <td>Group</td>
+        <td>Count</td>
+      </tr>
+      <tr>
+        <td>Smileys & Emotion</td>
+        <td>100</td>
+      </tr>
+      <tr>
+        <td>People & Body</td>
+        <td>200</td>
+      </tr>
+      <tr>
+        <td>Component</td>
+        <td>10</td>
+      </tr>
+      <tr>
+        <td>Total</td>
+        <td>310</td>
+      </tr>
+      <tr>
+        <td>With skin tone variations</td>
+        <td>25</td>
+      </tr>
+    </table>
   `;
 
   // 测试解析
@@ -282,19 +320,68 @@ async function testWithMockData() {
 
   // 验证关键数据
   const assertions = [
-    stats.total_without_skin_tone_variations === 300,
+    stats.total_without_skin_tone_variations === 275, // 310 - 25 - 10
     stats.component === 10,
-    stats.dual_skin_tone_support === 5,
+    stats.groups['Smileys & Emotion'] === 100,
+    stats.groups['People & Body'] === 200,
     Object.keys(emojiData).length > 0,
     groupData.length > 0
   ];
 
   const failedAssertions = assertions.filter(assertion => !assertion);
   if (failedAssertions.length > 0) {
+    console.log('Failed assertions:', failedAssertions);
     throw new Error('Some tests failed');
   }
 
   console.log('All tests passed!');
+}
+
+async function getLatestEmojiVersion() {
+  console.log('Checking for latest emoji version...');
+  const response = await fetchWithRetry(EMOJI_VERSION_URL);
+  const html = await response.text();
+  const $ = cheerio.load(html);
+  
+  // 获取最新版本号
+  const versionText = $('h2').first().text();
+  const versionMatch = versionText.match(/Emoji (\d+\.\d+)/);
+  if (!versionMatch) {
+    throw new Error('Could not determine latest emoji version');
+  }
+  
+  return versionMatch[1];
+}
+
+async function checkForUpdates() {
+  try {
+    const statsPath = path.join(__dirname, '..', 'test', 'stats.json');
+    if (!fs.existsSync(statsPath)) {
+      console.log('No existing stats file found. Will download fresh data.');
+      return true;
+    }
+    
+    const stats = JSON.parse(fs.readFileSync(statsPath, 'utf8'));
+    const lastUpdate = stats.last_update || 0;
+    const now = Date.now();
+    
+    // 检查是否需要更新
+    if (now - lastUpdate > CONFIG.versionCheckInterval) {
+      console.log('Update check interval reached. Checking for new version...');
+      const latestVersion = await getLatestEmojiVersion();
+      const currentVersion = stats.emoji_version || '0.0';
+      
+      if (latestVersion !== currentVersion) {
+        console.log(`New emoji version available: ${latestVersion} (current: ${currentVersion})`);
+        return true;
+      }
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('Error checking for updates:', error);
+    return true; // 如果检查失败，默认需要更新
+  }
 }
 
 async function main() {
@@ -302,6 +389,13 @@ async function main() {
     // 如果是测试模式，使用模拟数据
     if (process.argv.includes('--test')) {
       await testWithMockData();
+      return;
+    }
+
+    // 检查是否需要更新
+    const needsUpdate = CONFIG.autoUpdate ? await checkForUpdates() : true;
+    if (!needsUpdate) {
+      console.log('No updates needed. Current data is up to date.');
       return;
     }
 
@@ -328,6 +422,10 @@ async function main() {
     const stats = parseEmojiCounts(countsHtml);
     const emojiData = parseEmojiData(dataHtml);
     const groupData = generateGroupData(emojiData);
+
+    // 添加版本信息和更新时间
+    stats.emoji_version = await getLatestEmojiVersion();
+    stats.last_update = Date.now();
 
     // 保存统计信息
     fs.writeFileSync(
